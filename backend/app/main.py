@@ -1,81 +1,20 @@
 import io
 import os
 import secrets
-from fastapi import Request
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from starlette.concurrency import run_in_threadpool
+
+from app.agent import process_complaint_input
+
+app = FastAPI(title="Pharma QMS API")
 
 
-from app.agent import process_complaint_input 
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ComplaintRequest(BaseModel):
-    raw_text: str
-    existing_state: Optional[Dict[str, Any]] = None
-
-
-@app.post("/api/analyze-complaint")
-async def analyze_complaint(req: ComplaintRequest):
-    try:
-        result = process_complaint_input(req.raw_text, req.existing_state)
-        
-        # -------------------------------------------------------------------
-        # FIX: If this request is an UPDATE to an active form (existing_state exists),
-        # force duplicate flags to False so it doesn't trigger the warning banner.
-        # -------------------------------------------------------------------
-        if req.existing_state and isinstance(result, dict):
-            if "is_duplicate" in result:
-                result["is_duplicate"] = False
-            if "possible_duplicate" in result:
-                result["possible_duplicate"] = False
-            # If your dict nests fields inside an 'extracted_data' or 'analysis' key:
-            if "analysis" in result and isinstance(result["analysis"], dict):
-                result["analysis"]["is_duplicate"] = False
-                result["analysis"]["possible_duplicate"] = False
-        # -------------------------------------------------------------------
-
-        return {"status": "success", "data": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/upload-document")
-async def upload_document(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        extracted_text = ""
-
-        if file.filename.lower().endswith(".pdf"):
-            pdf_stream = io.BytesIO(contents)
-            pdf_reader = PdfReader(pdf_stream)
-            for page in pdf_reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    extracted_text += page_text + "\n"
-        else:
-            extracted_text = contents.decode("utf-8", errors="ignore")
-
-        if not extracted_text.strip():
-            raise HTTPException(
-                status_code=400, 
-                detail="Could not extract text from the uploaded file. Ensure it contains selectable text."
-            )
-
-        result = process_complaint_input(extracted_text, {})
-        @app.middleware("http")
+@app.middleware("http")
 async def authenticate_api(request: Request, call_next):
     if request.url.path.startswith("/api/"):
         expected = os.getenv("QMS_API_KEY", "")
@@ -103,8 +42,60 @@ async def authenticate_api(request: Request, call_next):
 async def health():
     return {"status": "ok"}
 
-        return {"status": "success", "data": result}
 
-    except Exception as e:
-        print(f"Error processing upload: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+class ComplaintRequest(BaseModel):
+    raw_text: str = Field(min_length=1, max_length=50000)
+    existing_state: Optional[Dict[str, Any]] = None
+
+
+async def analyze_text(raw_text, existing_state=None):
+    result = await run_in_threadpool(
+        process_complaint_input, raw_text, existing_state
+    )
+
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Invalid analysis response")
+
+    if result.get("chat_response") == (
+        "I encountered an error processing that request."
+    ):
+        raise HTTPException(status_code=502, detail="Analysis service failed")
+
+    # This prototype does not check historical database records.
+    result["possible_duplicate"] = None
+    result["duplicate_check_status"] = "not_performed"
+
+    return {"status": "success", "data": result}
+
+
+@app.post("/api/analyze-complaint", operation_id="analyzeComplaint")
+async def analyze_complaint(req: ComplaintRequest):
+    return await analyze_text(req.raw_text, req.existing_state)
+
+
+@app.post("/api/upload-document")
+async def upload_document(file: UploadFile = File(...)):
+    contents = await file.read(5 * 1024 * 1024 + 1)
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Maximum file size is 5 MB")
+
+    try:
+        filename = (file.filename or "").lower()
+        if filename.endswith(".pdf"):
+            reader = PdfReader(io.BytesIO(contents))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        elif filename.endswith(".txt"):
+            text = contents.decode("utf-8")
+        else:
+            raise HTTPException(status_code=400, detail="Use a PDF or TXT file")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unable to read document")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No selectable text found")
+    if len(text) > 50000:
+        raise HTTPException(status_code=413, detail="Maximum text length is 50000 characters")
+
+    return await analyze_text(text)
